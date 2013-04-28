@@ -39,6 +39,7 @@
 #include <linux/platform_device.h>
 #include <linux/suspend.h>
 #include <linux/reboot.h>
+#include <linux/power_supply.h>
 
 #include "twl-core.h"
 
@@ -54,7 +55,7 @@
  *
  */
 
-static int twl6030_interrupt_mapping[24] = {
+static int twl6030_interrupt_mapping_table[24] = {
 	PWR_INTR_OFFSET,	/* Bit 0	PWRON			*/
 	PWR_INTR_OFFSET,	/* Bit 1	RPWRON			*/
 	TWL_VLOW_INTR_OFFSET,	/* Bit 2	BAT_VLOW		*/
@@ -70,7 +71,7 @@ static int twl6030_interrupt_mapping[24] = {
 	MMCDETECT_INTR_OFFSET,	/* Bit 11	MMC			*/
 	RSV_INTR_OFFSET,  	/* Bit 12	Reserved		*/
 	MADC_INTR_OFFSET,	/* Bit 13	GPADC_RT_EOC		*/
-	MADC_INTR_OFFSET,	/* Bit 14	GPADC_SW_EOC		*/
+	GPADCSW_INTR_OFFSET,	/* Bit 14	GPADC_SW_EOC		*/
 	GASGAUGE_INTR_OFFSET,	/* Bit 15	CC_AUTOCAL		*/
 
 	USBOTG_INTR_OFFSET,	/* Bit 16	ID_WKUP			*/
@@ -82,6 +83,37 @@ static int twl6030_interrupt_mapping[24] = {
 	CHARGERFAULT_INTR_OFFSET,	/* Bit 22	INT_CHRG	*/
 	RSV_INTR_OFFSET,	/* Bit 23	Reserved		*/
 };
+
+static int twl6032_interrupt_mapping_table[24] = {
+	PWR_INTR_OFFSET,	/* Bit 0	PWRON			*/
+	PWR_INTR_OFFSET,	/* Bit 1	RPWRON			*/
+	TWL_VLOW_INTR_OFFSET,	/* Bit 2	SYS_VLOW		*/
+	RTC_INTR_OFFSET,	/* Bit 3	RTC_ALARM		*/
+	RTC_INTR_OFFSET,	/* Bit 4	RTC_PERIOD		*/
+	HOTDIE_INTR_OFFSET,	/* Bit 5	HOT_DIE			*/
+	SMPSLDO_INTR_OFFSET,	/* Bit 6	VXXX_SHORT		*/
+	PWR_INTR_OFFSET,	/* Bit 7	SPDURATION		*/
+
+	PWR_INTR_OFFSET,	/* Bit 8	WATCHDOG		*/
+	BATDETECT_INTR_OFFSET,	/* Bit 9	BAT			*/
+	SIMDETECT_INTR_OFFSET,	/* Bit 10	SIM			*/
+	MMCDETECT_INTR_OFFSET,	/* Bit 11	MMC			*/
+	MADC_INTR_OFFSET,	/* Bit 12	GPADC_RT_EOC		*/
+	GPADCSW_INTR_OFFSET,	/* Bit 13	GPADC_SW_EOC		*/
+	GASGAUGE_INTR_OFFSET,	/* Bit 14	CC_EOC		*/
+	GASGAUGE_INTR_OFFSET,	/* Bit 15	CC_AUTOCAL		*/
+
+	USBOTG_INTR_OFFSET,	/* Bit 16	ID_WKUP			*/
+	USBOTG_INTR_OFFSET,	/* Bit 17	VBUS_WKUP		*/
+	USBOTG_INTR_OFFSET,	/* Bit 18	ID			*/
+	USB_PRES_INTR_OFFSET,	/* Bit 19	VBUS			*/
+	CHARGER_INTR_OFFSET,	/* Bit 20	CHRG_CTRL		*/
+	CHARGERFAULT_INTR_OFFSET,	/* Bit 21	EXT_CHRG	*/
+	CHARGERFAULT_INTR_OFFSET,	/* Bit 22	INT_CHRG	*/
+	RSV_INTR_OFFSET,	/* Bit 23	Reserved		*/
+};
+
+static int *twl6030_interrupt_mapping = twl6030_interrupt_mapping_table;
 /*----------------------------------------------------------------------*/
 
 static unsigned twl6030_irq_base, twl6030_irq_end;
@@ -91,6 +123,8 @@ static bool twl_irq_wake_enabled;
 static struct task_struct *task;
 static struct completion irq_event;
 static atomic_t twl6030_wakeirqs = ATOMIC_INIT(0);
+
+static u8 vbatmin_hi_threshold;
 
 static int twl6030_irq_pm_notifier(struct notifier_block *notifier,
 				   unsigned long pm_event, void *unused)
@@ -232,8 +266,19 @@ static irqreturn_t handle_twl6030_pih(int irq, void *devid)
  */
 static irqreturn_t handle_twl6030_vlow(int irq, void *unused)
 {
-	pr_info("handle_twl6030_vlow: kernel_power_off()\n");
-	kernel_power_off();
+	pr_err("twl6030: BAT_VLOW interrupt; threshold=%dmV\n",
+	       2300 + (vbatmin_hi_threshold - 0b110) * 50);
+
+#if 1 /* temporary */
+	pr_err("%s: disabling BAT_VLOW interrupt\n", __func__);
+	disable_irq_nosync(twl6030_irq_base + TWL_VLOW_INTR_OFFSET);
+	WARN_ON(1);
+#else
+	if (!power_supply_is_system_supplied()) {
+		pr_emerg("handle_twl6030_vlow: kernel_power_off()\n");
+		kernel_power_off();
+	}
+#endif
 	return IRQ_HANDLED;
 }
 
@@ -336,6 +381,16 @@ int twl6030_mmc_card_detect_config(void)
 									ret);
 		return ret;
 	}
+
+	ret = twl_i2c_write_u8(TWL6030_MODULE_ID0,
+			(MMC_MINS_DEB_MASK | MMC_MEXT_DEB_MASK),
+			TWL6030_MMCDEBOUNCING);
+	if (ret < 0){
+		pr_err("twl6030: Failed to write MMC_MEXT_DEB_MASK %d\n",
+									ret);
+		return ret;
+	}
+
 	return 0;
 }
 EXPORT_SYMBOL(twl6030_mmc_card_detect_config);
@@ -416,6 +471,9 @@ int twl6030_vlow_init(int vlow_irq)
 		return status;
 	}
 
+	twl_i2c_read_u8(TWL_MODULE_PM_MASTER, &vbatmin_hi_threshold,
+			TWL6030_VBATMIN_HI_THRESHOLD);
+
 	/* install an irq handler for vlow */
 	status = request_threaded_irq(vlow_irq, NULL, handle_twl6030_vlow,
 			IRQF_ONESHOT,
@@ -429,7 +487,8 @@ int twl6030_vlow_init(int vlow_irq)
 	return 0;
 }
 
-int twl6030_init_irq(int irq_num, unsigned irq_base, unsigned irq_end)
+int twl6030_init_irq(int irq_num, unsigned irq_base, unsigned irq_end,
+			unsigned long features)
 {
 
 	int	status = 0;
@@ -438,6 +497,10 @@ int twl6030_init_irq(int irq_num, unsigned irq_base, unsigned irq_end)
 	u8 mask[4];
 
 	static struct irq_chip	twl6030_irq_chip;
+
+	if (features & TWL6032_SUBCLASS)
+		twl6030_interrupt_mapping = twl6032_interrupt_mapping_table;
+
 	mask[1] = 0xFF;
 	mask[2] = 0xFF;
 	mask[3] = 0xFF;

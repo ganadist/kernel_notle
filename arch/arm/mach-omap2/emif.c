@@ -19,6 +19,7 @@
 #include <linux/err.h>
 #include <linux/interrupt.h>
 #include <linux/platform_device.h>
+#include <linux/reboot.h>
 #include <linux/slab.h>
 
 #include <plat/omap_hwmod.h>
@@ -60,6 +61,21 @@ static struct omap_device_pm_latency omap_emif_latency[] = {
 	       .flags = OMAP_DEVICE_LATENCY_AUTO_ADJUST,
 	       },
 };
+
+/*
+ * EMIF Power Management timer for Self Refresh will put the external SDRAM
+ * in Self Refresh mode after the EMIF is idle for number of DDR clock cycles
+ * set with REG_SR_TIM. The minimal value starts at 16 cycles mapped to 1 in
+ * REG_SR_TIM.
+ * However due to Errata i735, the minimal value of REG_SR_TIM is 6. That
+ * corresponds to 512 DDR cycles required for OPP100
+*/
+#define EMIF_ERRATUM_SR_TIMER_i735	BIT(0)
+#define EMIF_ERRATUM_SR_TIMER_MIN	6
+
+static u32 emif_errata;
+#define is_emif_erratum(erratum) (emif_errata & EMIF_ERRATUM_##erratum)
+
 
 static void do_cancel_out(u32 *num, u32 *den, u32 factor)
 {
@@ -505,8 +521,10 @@ static u32 get_ddr_phy_ctrl_1(u32 freq, u8 RL)
 		val = EMIF_DLL_SLAVE_DLY_CTRL_100_MHZ_AND_LESS;
 	else if (freq <= 200000000)
 		val = EMIF_DLL_SLAVE_DLY_CTRL_200_MHZ;
-	else
+	else if (freq <= 400000000)
 		val = EMIF_DLL_SLAVE_DLY_CTRL_400_MHZ;
+	else
+		val = EMIF_DLL_SLAVE_DLY_CTRL_466_MHZ;
 	mask_n_set(phy, OMAP44XX_REG_DLL_SLAVE_DLY_CTRL_SHIFT,
 		   OMAP44XX_REG_DLL_SLAVE_DLY_CTRL_MASK, val);
 
@@ -806,6 +824,13 @@ static irqreturn_t emif_threaded_isr(int irq, void *dev_id)
 		kobject_uevent(&(emif[emif_nr].pdev->dev.kobj), KOBJ_CHANGE);
 		/* clear the bit */
 		emif_notify_pending &= ~(1 << emif_nr);
+	}
+
+	if (emif_temperature_level[emif_nr] >= SDRAM_TEMP_VERY_HIGH_SHUTDOWN) {
+		pr_emerg("%s %d: SDRAM temperature exceeds operating"
+			"limit.. Shutdown system...\n", __func__, emif_nr + 1);
+
+		kernel_power_off();
 	}
 
 	return IRQ_HANDLED;
@@ -1152,9 +1177,18 @@ static void init_temperature(u32 emif_nr)
 				   &dev_attr_temperature));
 	kobject_uevent(&(emif[emif_nr].pdev->dev.kobj), KOBJ_ADD);
 
-	if (emif_temperature_level[emif_nr] == SDRAM_TEMP_VERY_HIGH_SHUTDOWN)
+	if (emif_temperature_level[emif_nr] >= SDRAM_TEMP_VERY_HIGH_SHUTDOWN) {
 		pr_emerg("EMIF %d: SDRAM temperature exceeds operating"
-			 "limit.. Needs shut down!!!", emif_nr + 1);
+			 "limit! Powering OFF\n", emif_nr + 1);
+
+		kernel_power_off();
+	}
+}
+
+static void __init emif_setup_errata(void)
+{
+	if (cpu_is_omap44xx())
+		emif_errata |= EMIF_ERRATUM_SR_TIMER_i735;
 }
 
 /*
@@ -1164,6 +1198,8 @@ static void init_temperature(u32 emif_nr)
  */
 static int __init omap_emif_device_init(void)
 {
+	/* setup the erratas */
+	emif_setup_errata();
 	/*
 	 * To avoid code running on other OMAPs in
 	 * multi-omap builds
@@ -1415,9 +1451,6 @@ static void __init setup_lowpower_regs(u32 emif_nr,
 	if (dev->emif_ddr_selfrefresh_cycles >= 0) {
 		u32 num_cycles, ddr_sr_timer;
 
-		/* Enable self refresh if not already configured */
-		temp = __raw_readl(base + OMAP44XX_EMIF_PWR_MGMT_CTRL) &
-			OMAP44XX_REG_LP_MODE_MASK;
 		/*
 		 * Configure the self refresh timing
 		 * base value starts at 16 cycles mapped to 1( __fls(16) = 4)
@@ -1428,6 +1461,18 @@ static void __init setup_lowpower_regs(u32 emif_nr,
 		else
 			ddr_sr_timer = 0;
 
+		if (is_emif_erratum(SR_TIMER_i735) &&
+				ddr_sr_timer < EMIF_ERRATUM_SR_TIMER_MIN) {
+			/*
+			 * Operating with such SR_TIM value will cause
+			 * instability, so re-adjust to safe value as stated
+			 * by erratum i735
+			 */
+			ddr_sr_timer = EMIF_ERRATUM_SR_TIMER_MIN;
+			pr_warning("%s: PM timer for self refresh is set to %i"
+					" cycles\n", __func__,
+					16 << (EMIF_ERRATUM_SR_TIMER_MIN - 1));
+		}
 		/* Program the idle delay */
 		temp = __raw_readl(base + OMAP44XX_EMIF_PWR_MGMT_CTRL_SHDW);
 		mask_n_set(temp, OMAP44XX_REG_SR_TIM_SHDW_SHIFT,
@@ -1441,24 +1486,18 @@ static void __init setup_lowpower_regs(u32 emif_nr,
 		__raw_writel(temp, base + OMAP44XX_EMIF_PWR_MGMT_CTRL_SHDW);
 
 		/* Enable Self Refresh */
-		temp = __raw_readl(base + OMAP44XX_EMIF_PWR_MGMT_CTRL);
-		mask_n_set(temp, OMAP44XX_REG_LP_MODE_SHIFT,
-			   OMAP44XX_REG_LP_MODE_MASK, LP_MODE_SELF_REFRESH);
-		__raw_writel(temp, base + OMAP44XX_EMIF_PWR_MGMT_CTRL);
+		set_lp_mode(emif_nr, LP_MODE_SELF_REFRESH);
 	} else {
-		/* Disable Automatic power management if < 0 and not disabled */
-		temp = __raw_readl(base + OMAP44XX_EMIF_PWR_MGMT_CTRL) &
-			OMAP44XX_REG_LP_MODE_MASK;
+		/* Disable Automatic power management if < 0 */
 
+		/* Program the idle delay to 0x0 */
 		temp = __raw_readl(base + OMAP44XX_EMIF_PWR_MGMT_CTRL_SHDW);
 		mask_n_set(temp, OMAP44XX_REG_SR_TIM_SHDW_SHIFT,
 			   OMAP44XX_REG_SR_TIM_SHDW_MASK, 0x0);
 		__raw_writel(temp, base + OMAP44XX_EMIF_PWR_MGMT_CTRL_SHDW);
 
-		temp = __raw_readl(base + OMAP44XX_EMIF_PWR_MGMT_CTRL);
-		mask_n_set(temp, OMAP44XX_REG_LP_MODE_SHIFT,
-			   OMAP44XX_REG_LP_MODE_MASK, LP_MODE_DISABLE);
-		__raw_writel(temp, base + OMAP44XX_EMIF_PWR_MGMT_CTRL);
+		/* Disable Automatic power management */
+		set_lp_mode(emif_nr, LP_MODE_DISABLE);
 	}
 }
 

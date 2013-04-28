@@ -60,6 +60,7 @@ EXPORT_SYMBOL(omap_prcm_get_reset_sources);
 /* Resets clock rates and reboots the system. Only called from system.h */
 static void omap_prcm_arch_reset(char mode, const char *cmd)
 {
+
 	s16 prcm_offs = 0;
 
 	if (cpu_is_omap24xx()) {

@@ -240,6 +240,17 @@ config OMAP_DM_TIMER
 	help
 	 Select this option if you want to use OMAP Dual-Mode timers.
 
+config OMAP_DM_TIMER_PWM
+	bool "Use dual-mode timers to generate PWM outputs"
+	depends on OMAP_DM_TIMER && ARCH_OMAP2PLUS
+	select HAVE_PWM
+	help
+	 Select this option if you want to use OMAP Dual-Mode timers
+	 to output pulse-width modulation (pwm) signals.  Note that
+	 you cannot have this option and any other option that
+	 provides pwm functionality via the pwm_request family of
+	 functions.
+
 config OMAP_SERIAL_WAKE
 	bool "Enable wake-up events for serial ports"
 	depends on ARCH_OMAP1 && OMAP_MUX
@@ -262,11 +273,20 @@ config OMAP_TEMP_SENSOR
 # this carveout should probably become generic and not omap specific
 config OMAP_REMOTEPROC_MEMPOOL_SIZE
 	hex "Physical carveout memory pool size (Byte)"
-	depends on OMAP_REMOTE_PROC
+	depends on OMAP_REMOTE_PROC_IPU
 	default 0x700000
 	help
 	  Allocate specified size of memory at boot time so we can ioremap
 	  it safely.
+
+config OMAP_REMOTEPROC_MEMPOOL_SIZE_DSP
+        hex "Physical carveout memory pool size for DSP (Byte)"
+        depends on OMAP_REMOTE_PROC_DSP
+        default 0x600000
+        help
+          Allocate specified size of memory at boot time so we can ioremap
+          it safely. This memory will be used for the DSP remote processor
+          only.
 
 choice
 	prompt "OMAP PM layer selection"

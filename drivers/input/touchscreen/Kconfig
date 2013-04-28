@@ -374,6 +374,40 @@ config TOUCHSCREEN_MIGOR
 	  To compile this driver as a module, choose M here: the
 	  module will be called migor_ts.
 
+config TOUCHSCREEN_SYNAPTICS_RMI4_I2C
+	tristate "Synaptics RMI4 I2C touchscreens"
+	depends on I2C
+	help
+	  Say Y here if you have a Synaptics RMI4 I2C touchscreen connected to
+	  your system. This enables support for Synaptics RMI4 over I2C based
+	  touchscreens.
+
+	  If unsure, say N.
+
+	  To compile this driver as a set of modules, choose M here: the
+	  modules will be called rmi_core, rmi_app_touchpad, rmi_phys_i2c.
+
+config TOUCHSCREEN_SYNAPTICS_RMI4_SPI
+	tristate "Synaptics RMI4 SPI touchscreens"
+	depends on SPI
+	help
+	  Say Y here if you have a Synaptics RMI4 SPI touchscreen connected to
+	  your system. This enables support for Synaptics RMI4 over SPI based
+	  touchscreens.
+
+	  If unsure, say N.
+
+	  To compile this driver as a set of modules, choose M here: the
+	  modules will be called rmi_core, rmi_app_touchpad, rmi_phys_spi.
+
+config SYNA_MULTI_TOUCH
+	bool "Synaptics pointing using multi-touch events"
+	depends on TOUCHSCREEN_SYNAPTICS_RMI4_I2C || TOUCHSCREEN_SYNAPTICS_RMI4_SPI
+
+config SYNA_WAKE_ON_TOUCH
+	bool "Synaptics pointing with interrupts enabled to wake system"
+	depends on TOUCHSCREEN_SYNAPTICS_RMI4_I2C
+
 config TOUCHSCREEN_TNETV107X
 	tristate "TI TNETV107X touchscreen support"
 	depends on ARCH_DAVINCI_TNETV107X
@@ -720,6 +754,12 @@ config TOUCHSCREEN_STMPE
 	  To compile this driver as a module, choose M here: the
 	  module will be called stmpe-ts.
 
+config TOUCHSCREEN_STOUCH
+        tristate "STouch STMPE stmpe32m28 touchpad"
+        depends on I2C
+        help
+          This enables the STouch stmpe32m28 touchpad.
+
 config TOUCHSCREEN_TPS6507X
 	tristate "TPS6507x based touchscreens"
 	depends on I2C
@@ -731,5 +771,34 @@ config TOUCHSCREEN_TPS6507X
 
 	  To compile this driver as a module, choose M here: the
 	  module will be called tps6507x_ts.
+
+config TOUCHSCREEN_SYNTM12XX
+	tristate "Synaptic TM12xx touchscreen"
+	depends on I2C
+	help
+	  Say Y here to enable support for Synaptic TM12xx
+	  series touchscreen controller.
+
+	  If unsure, say N.
+
+	  To compile this driver as module, choose M here: the
+	  module will be called syntm12xx
+
+config TOUCHSCREEN_QUANTUM_OBP
+	tristate "Quantum OBP based touchscreens"
+	depends on I2C
+	help
+	  Say Y here if you have a Quantum touchscreen that uses
+	  the Object Based Protocol based firmware.
+
+	  If unsure, say N.
+
+config TOUCHSCREEN_CYPRESS_TTSP
+	tristate "Cypress True Touch touchscreens"
+	depends on I2C
+	help
+	  Say Y here if you have a Cypress true touch touchscreen.
+
+	  If unsure, say N.
 
 endif

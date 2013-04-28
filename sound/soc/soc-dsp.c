@@ -851,6 +851,7 @@ int soc_dsp_fe_dai_prepare(struct snd_pcm_substream *substream)
 	runtime_update = fe->dsp[stream].runtime_update;
 	fe->dsp[stream].runtime_update = SND_SOC_DSP_UPDATE_FE;
 
+#ifndef CONFIG_MACH_NOTLE
 	/* there is no point preparing this FE if there are no BEs */
 	if (list_empty(&fe->dsp[stream].be_clients)) {
 		dev_err(&fe->dev, "dsp: no backend DAIs enabled for %s\n",
@@ -858,6 +859,7 @@ int soc_dsp_fe_dai_prepare(struct snd_pcm_substream *substream)
 		ret = -EINVAL;
 		goto out;
 	}
+#endif
 
 	ret = soc_dsp_be_dai_prepare(fe, substream->stream);
 	if (ret < 0)
@@ -1658,13 +1660,14 @@ static ssize_t soc_dsp_show_state(struct snd_soc_pcm_runtime *fe,
 
 	list_for_each_entry(dsp_params, &fe->dsp[stream].be_clients, list_be) {
 		struct snd_soc_pcm_runtime *be = dsp_params->be;
+		params = &dsp_params->hw_params;
 
 		offset += snprintf(buf + offset, size - offset,
 				"- %s\n", be->dai_link->name);
 
 		offset += snprintf(buf + offset, size - offset,
 				"   State: %s\n",
-				dsp_state_string(fe->dsp[stream].state));
+				dsp_state_string(be->dsp[stream].state));
 
 		if ((be->dsp[stream].state >= SND_SOC_DSP_STATE_HW_PARAMS) &&
 		    (be->dsp[stream].state <= SND_SOC_DSP_STATE_STOP))

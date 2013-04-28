@@ -103,7 +103,8 @@ enum fw_resource_type {
 	RSC_TRACE	= 4,
 	RSC_BOOTADDR	= 5,
 	RSC_CRASHDUMP	= 6,
-	RSC_END		= 7,
+	RSC_SUSPENDADDR	= 7,
+	RSC_END		= 8,
 };
 
 /**
@@ -160,6 +161,7 @@ struct rproc_ops {
 	int (*watchdog_init)(struct rproc *, int (*)(struct rproc *));
 	int (*watchdog_exit)(struct rproc *);
 	void (*dump_registers)(struct rproc *);
+	int (*pm_init)(struct rproc *rproc, u64 suspaddr);
 };
 
 /*
@@ -201,6 +203,13 @@ enum rproc_state {
  *		  POS_SUSPEND event.
  *
  * @RPROC_SECURE: remote processor secure mode has changed.
+ *
+ * @RPROC_LOAD_ERROR: an error has occurred during loading the remote processor
+ *                    binary. users can use this event to release any resources
+ *                    acquired after a request to start the processor.
+ *
+ * @RPROC_PRELOAD: users can register for this event to perform any actions
+ *                 before the remoteproc starts loading the binary into memory.
  */
 enum rproc_event {
 	RPROC_ERROR,
@@ -208,6 +217,8 @@ enum rproc_event {
 	RPROC_POS_SUSPEND,
 	RPROC_RESUME,
 	RPROC_SECURE,
+	RPROC_LOAD_ERROR,
+	RPROC_PRELOAD,
 };
 
 #define RPROC_MAX_NAME	100
@@ -246,6 +257,7 @@ enum rproc_event {
  * @secure_restart: completion event notifier for the secure restart process
  * @secure_mode: flag to dictate whether to enable secure loading
  * @secure_ok: restart status flag to be looked up upon the event's completion
+ * @secure_reset: flag to uninstall the firewalls
  */
 struct rproc {
 	struct list_head next;
@@ -267,7 +279,6 @@ struct rproc {
 	int last_trace_len0, last_trace_len1;
 	void *cdump_buf0, *cdump_buf1;
 	int cdump_len0, cdump_len1;
-	struct mutex tlock;
 	struct completion firmware_loading_complete;
 	struct work_struct error_work;
 	struct blocking_notifier_head nbh;
@@ -284,6 +295,7 @@ struct rproc {
 	struct mutex secure_lock;
 	bool secure_mode;
 	bool secure_ok;
+	bool secure_reset;
 	bool halt_on_crash;
 	char *header;
 	int header_len;
@@ -299,6 +311,8 @@ int rproc_register(struct device *, const char *, const struct rproc_ops *,
 		unsigned int timeout);
 int rproc_unregister(const char *);
 void rproc_last_busy(struct rproc *);
+int rproc_da_to_pa(struct rproc *, u64, phys_addr_t *);
+int rproc_pa_to_da(struct rproc *, phys_addr_t, u64 *);
 #ifdef CONFIG_REMOTE_PROC_AUTOSUSPEND
 extern const struct dev_pm_ops rproc_gen_pm_ops;
 #define GENERIC_RPROC_PM_OPS	(&rproc_gen_pm_ops)

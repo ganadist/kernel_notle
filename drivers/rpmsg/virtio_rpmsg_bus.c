@@ -51,6 +51,7 @@
  * @endpoints_lock: lock of the endpoints set
  * @sendq:	wait queue of sending contexts waiting for free rpmsg buffer
  * @ns_ept:	the bus's name service endpoint
+ * @rproc:	a reference to the remote processor object
  *
  * This structure stores the rpmsg state of a given virtio remote processor
  * device (there might be several virtio rproc devices for each physical
@@ -69,6 +70,7 @@ struct virtproc_info {
 	spinlock_t endpoints_lock;
 	wait_queue_head_t sendq;
 	struct rpmsg_endpoint *ns_ept;
+	struct rproc *rproc;
 };
 
 #define to_rpmsg_channel(d) container_of(d, struct rpmsg_channel, dev)
@@ -508,8 +510,10 @@ int rpmsg_send_offchannel_raw(struct rpmsg_channel *rpdev, u32 src, u32 dst,
 	dev_dbg(dev, "TX From 0x%x, To 0x%x, Len %d, Flags %d, Unused %d\n",
 					msg->src, msg->dst, msg->len,
 					msg->flags, msg->unused);
+#if 0
 	print_hex_dump(KERN_DEBUG, "rpmsg_virtio TX: ", DUMP_PREFIX_NONE, 16, 1,
 					msg, sizeof(*msg) + msg->len, true);
+#endif
 
 	offset = ((unsigned long) msg) - ((unsigned long) vrp->rbufs);
 	sim_addr = vrp->sim_base + offset;
@@ -534,6 +538,14 @@ out:
 }
 EXPORT_SYMBOL(rpmsg_send_offchannel_raw);
 
+struct rproc *rpmsg_get_rproc_handle(struct rpmsg_channel *rpdev)
+{
+	if (!rpdev || !rpdev->vrp)
+		return NULL;
+	return rpdev->vrp->rproc;
+}
+EXPORT_SYMBOL(rpmsg_get_rproc_handle);
+
 static void rpmsg_recv_done(struct virtqueue *rvq)
 {
 	struct rpmsg_hdr *msg;
@@ -557,8 +569,10 @@ static void rpmsg_recv_done(struct virtqueue *rvq)
 	dev_dbg(dev, "From: 0x%x, To: 0x%x, Len: %d, Flags: %d, Unused: %d\n",
 					msg->src, msg->dst, msg->len,
 					msg->flags, msg->unused);
+#if 0
 	print_hex_dump(KERN_DEBUG, "rpmsg_virtio RX: ", DUMP_PREFIX_NONE, 16, 1,
 					msg, sizeof(*msg) + msg->len, true);
+#endif
 
 	/* fetch the callback of the appropriate user */
 	spin_lock(&vrp->endpoints_lock);
@@ -631,7 +645,7 @@ static void rpmsg_ns_cb(struct rpmsg_channel *rpdev, void *data, int len,
 	/* don't trust the remote processor for null terminating the name */
 	msg->name[RPMSG_NAME_SIZE - 1] = '\0';
 
-	dev_info(dev, "%sing channel %s addr 0x%x\n",
+	dev_dbg(dev, "%sing channel %s addr 0x%x\n",
 			msg->flags & RPMSG_NS_DESTROY ? "destroy" : "creat",
 			msg->name, msg->addr);
 
@@ -698,6 +712,10 @@ static int rpmsg_probe(struct virtio_device *vdev)
 	/* simulated addr base to make virt_to_page happy */
 	vdev->config->get(vdev, VPROC_SIM_BASE, &vrp->sim_base,
 							sizeof(vrp->sim_base));
+
+	/* also store reference to remote proc */
+	vdev->config->get(vdev, VPROC_RPROC_REF,
+			&vrp->rproc, sizeof(vrp->rproc));
 
 	/* set up the receive buffers */
 	for (i = 0; i < num_bufs / 2; i++) {

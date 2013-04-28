@@ -44,6 +44,13 @@ struct gpio_keys_drvdata {
 	struct gpio_button_data data[0];
 };
 
+/* Google specific enums for logging gpio key presses. */
+typedef enum {
+	GPIO_KEYS_PROBE = 0,
+	GPIO_KEYS_WORK = 1,
+	GPIO_KEYS_RESUME = 2
+} gpio_key_caller_t;
+
 /*
  * SYSFS interface for enabling/disabling keys and switches:
  *
@@ -317,12 +324,38 @@ static struct attribute_group gpio_keys_attr_group = {
 	.attrs = gpio_keys_attrs,
 };
 
-static void gpio_keys_report_event(struct gpio_button_data *bdata)
+static void gpio_keys_report_event(struct gpio_button_data *bdata, gpio_key_caller_t caller)
 {
 	struct gpio_keys_button *button = bdata->button;
 	struct input_dev *input = bdata->input;
 	unsigned int type = button->type ?: EV_KEY;
+	int synthesized = 0;
 	int state = (gpio_get_value_cansleep(button->gpio) ? 1 : 0) ^ button->active_low;
+
+	/* last_state is a tri-state value.  If last_state is -1 then we are not in
+	   a suspend/resume cycle.  If last_state is 0 or 1, it means that its the
+	   cached value of the last state of the gpio when we entered the suspend
+	   cycle and we have not exited via a resume. */
+	if (button->last_state == state) {
+		/* Synthesize a new state here because we are here
+		   due to an interrupt while suspended.  However, the
+		   present value does not reflect the value that generated
+		   the interrupt due to the time required to resume power
+		   and read this pin. */
+		state = (state ^ 1);
+		synthesized = 1;
+	} else if (button->cache_state == state && caller == GPIO_KEYS_WORK) {
+		/* HACK */
+		/* We were called here from the work queue indicating that there
+		   was work to be done.  However, we found that the current
+		   gpio state has not changed from the previous gpio state.
+		   So we make up an event! */
+		input_event(input, type, button->code, !state);
+		input_sync(input);
+		dev_info(&input->dev, "Camera button caller:%d %s inferred\n",
+			 caller,
+			 ((!state)?"pressed":"released"));
+	}
 
 	if (type == EV_ABS) {
 		if (state)
@@ -331,6 +364,14 @@ static void gpio_keys_report_event(struct gpio_button_data *bdata)
 		input_event(input, type, button->code, !!state);
 	}
 	input_sync(input);
+
+	/* Store away current state */
+	button->cache_state = state;
+
+	dev_info(&input->dev, "Camera button caller:%d %s %s\n",
+	         caller,
+	         ((state)?"pressed":"released"),
+	         ((synthesized)?"synthesized":"polled"));
 }
 
 static void gpio_keys_work_func(struct work_struct *work)
@@ -338,7 +379,7 @@ static void gpio_keys_work_func(struct work_struct *work)
 	struct gpio_button_data *bdata =
 		container_of(work, struct gpio_button_data, work);
 
-	gpio_keys_report_event(bdata);
+	gpio_keys_report_event(bdata, GPIO_KEYS_WORK);
 }
 
 static void gpio_keys_timer(unsigned long _data)
@@ -422,6 +463,10 @@ static int __devinit gpio_keys_setup_key(struct platform_device *pdev,
 		goto fail3;
 	}
 
+	/* Initialize last state to indicate not in suspend */
+	button->last_state = -1;
+	/* Initialize cache state to invalid value */
+	button->cache_state = -1;
 	return 0;
 
 fail3:
@@ -513,6 +558,13 @@ static int __devinit gpio_keys_probe(struct platform_device *pdev)
 		goto fail2;
 	}
 
+	/* If any single key button can wake the device, we need to inform
+	   the input subsystem not to mess with our key state during a suspend
+	   and resume cycle. */
+	if (wakeup) {
+		device_set_wakeup_capable(&input->dev, true);
+	}
+
 	error = input_register_device(input);
 	if (error) {
 		dev_err(dev, "Unable to register input device, error: %d\n",
@@ -522,7 +574,7 @@ static int __devinit gpio_keys_probe(struct platform_device *pdev)
 
 	/* get current state of buttons */
 	for (i = 0; i < pdata->nbuttons; i++)
-		gpio_keys_report_event(&ddata->data[i]);
+		gpio_keys_report_event(&ddata->data[i], GPIO_KEYS_PROBE);
 	input_sync(input);
 
 	device_init_wakeup(&pdev->dev, wakeup);
@@ -587,6 +639,8 @@ static int gpio_keys_suspend(struct device *dev)
 			if (button->wakeup) {
 				int irq = gpio_to_irq(button->gpio);
 				enable_irq_wake(irq);
+				/* Store the last state before suspending */
+				button->last_state = (gpio_get_value_cansleep(button->gpio) ? 1 : 0) ^ button->active_low;
 			}
 		}
 	}
@@ -607,9 +661,12 @@ static int gpio_keys_resume(struct device *dev)
 		if (button->wakeup && device_may_wakeup(&pdev->dev)) {
 			int irq = gpio_to_irq(button->gpio);
 			disable_irq_wake(irq);
+			/* Set last state before suspend to invalid value 
+			 * since we are now resumed */
+			button->last_state = -1;
 		}
 
-		gpio_keys_report_event(&ddata->data[i]);
+		gpio_keys_report_event(&ddata->data[i], GPIO_KEYS_RESUME);
 	}
 	input_sync(ddata->input);
 

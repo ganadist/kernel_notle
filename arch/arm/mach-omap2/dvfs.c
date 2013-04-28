@@ -19,6 +19,7 @@
 #include <linux/clk.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
+#include <linux/pm_qos_params.h>
 #include <plat/common.h>
 #include <plat/omap_device.h>
 #include <plat/omap_hwmod.h>
@@ -27,7 +28,9 @@
 #include "smartreflex.h"
 #include "powerdomain.h"
 #include "pm.h"
-
+#ifdef CONFIG_OMAP4_DPLL_CASCADING
+#include <mach/omap4-common.h>
+#endif
 /**
  * DOC: Introduction
  * =================
@@ -192,6 +195,9 @@ struct omap_vdd_dvfs_info {
 
 static LIST_HEAD(omap_dvfs_info_list);
 DEFINE_MUTEX(omap_dvfs_lock);
+
+/* QoS expected */
+static struct pm_qos_request_list omap_dvfs_pm_qos_handle;
 
 /* Dvfs scale helper function */
 static int _dvfs_scale(struct device *req_dev, struct device *target_dev,
@@ -525,7 +531,7 @@ static int _remove_freq_request(struct omap_vdd_dvfs_info *dvfs_info,
  *
  * This runs down the table provided to find the match for main_volt
  * provided and sets up a scale request for the dependent domain
- * for the dependent voltage.
+ * for the dependent OPP.
  *
  * Returns 0 if all went well.
  */
@@ -537,7 +543,7 @@ static int _dep_scan_table(struct device *dev,
 	struct omap_vdd_dvfs_info *tdvfs_info;
 	struct opp *opp;
 	int i, ret;
-	unsigned long dep_volt = 0, new_freq = 0;
+	unsigned long dep_volt = 0, new_dep_volt = 0, new_freq = 0;
 
 	if (!dep_table) {
 		dev_err(dev, "%s: deptable not present for vdd%s\n",
@@ -568,14 +574,6 @@ static int _dep_scan_table(struct device *dev,
 		}
 	}
 
-	/* See if dep_volt is possible for the vdd*/
-	ret = _add_vdd_user(_voltdm_to_dvfs_info(dep_info->_dep_voltdm),
-			dev, dep_volt);
-	if (ret)
-		dev_err(dev, "%s: Failed to add dep to domain %s volt=%ld\n",
-				__func__, dep_info->name, dep_volt);
-
-	/* And also add corresponding freq request */
 	tdvfs_info = _voltdm_to_dvfs_info(dep_info->_dep_voltdm);
 	if (!tdvfs_info) {
 		dev_warn(dev, "%s: no dvfs_info\n",
@@ -591,18 +589,41 @@ static int _dep_scan_table(struct device *dev,
 
 	rcu_read_lock();
 	opp = _volt_to_opp(target_dev, dep_volt);
-	if (!IS_ERR(opp))
+	if (!IS_ERR(opp)) {
+		new_dep_volt = opp_get_voltage(opp);
 		new_freq = opp_get_freq(opp);
+	}
 	rcu_read_unlock();
 
-	if (new_freq) {
-		ret = _add_freq_request(tdvfs_info, dev, target_dev, new_freq);
-		if (ret) {
-			dev_err(target_dev, "%s: freqadd(%s) failed %d[f=%ld,"
-					"v=%ld]\n", __func__, dev_name(dev),
-					i, new_freq, dep_volt);
-			return ret;
-		}
+	if (!new_dep_volt || !new_freq) {
+		dev_err(target_dev, "%s: no valid OPP for voltage %lu\n",
+				__func__, dep_volt);
+		return -ENODATA;
+	}
+
+	/* TODO: In case of _add_vdd_user() failure
+	 * _dep_scan_table() will end up with previous voltage request,
+	 * but without a frequency request.
+	 * System should be left in previous state in case of failure.
+	 * Same issue is present in omap_device_scale() function.
+	 */
+	ret = _add_freq_request(tdvfs_info, dev, target_dev, new_freq);
+	if (ret) {
+		dev_err(target_dev, "%s: freqadd(%s) failed %d"
+				"[f=%ld, v=%ld(%ld)]\n",
+				__func__, dev_name(dev), ret, new_freq,
+				new_dep_volt, dep_volt);
+		return ret;
+	}
+
+	ret = _add_vdd_user(tdvfs_info, dev, new_dep_volt);
+	if (ret) {
+		dev_err(target_dev, "%s: vddadd(%s) failed %d"
+				"[f=%ld, v=%ld(%ld)]\n",
+				__func__, dev_name(dev), ret, new_freq,
+				new_dep_volt, dep_volt);
+		_remove_freq_request(tdvfs_info, dev, target_dev);
+		return ret;
 	}
 
 	return ret;
@@ -731,6 +752,7 @@ static int _dvfs_scale(struct device *req_dev, struct device *target_dev,
 	struct omap_vdd_info *vdd;
 	struct omap_volt_data *new_vdata;
 	struct omap_volt_data *curr_vdata;
+	struct list_head *dev_list;
 
 	voltdm = tdvfs_info->voltdm;
 	if (IS_ERR_OR_NULL(voltdm)) {
@@ -811,13 +833,22 @@ static int _dvfs_scale(struct device *req_dev, struct device *target_dev,
 		}
 	}
 
-	/* Move all devices in list to the required frequencies */
-	list_for_each_entry(temp_dev, &tdvfs_info->dev_list, node) {
+	/*
+	 * Move all devices in list to the required frequencies.
+	 * Devices are put in list in strict order, such as, when
+	 * scaling up to higher OPP, dependent frequencies will be scaled
+	 * after the frequency on which they depend. In case of scaling
+	 * down to lower OPP the order of scaling frequencies is reverse.
+	 */
+	dev_list = (volt_scale_dir == DVFS_VOLT_SCALE_DOWN) ?
+			tdvfs_info->dev_list.prev : tdvfs_info->dev_list.next;
+	while (dev_list != &tdvfs_info->dev_list) {
 		struct device *dev;
 		struct opp *opp;
 		unsigned long freq = 0;
 		int r;
 
+		temp_dev = list_entry(dev_list, struct omap_vdd_dev_list, node);
 		dev = temp_dev->dev;
 		if (!plist_head_empty(&temp_dev->freq_user_list)) {
 			node = plist_last(&temp_dev->freq_user_list);
@@ -837,13 +868,13 @@ static int _dvfs_scale(struct device *req_dev, struct device *target_dev,
 				rcu_read_unlock();
 			}
 			if (!freq)
-				continue;
+				goto next;
 		}
 
 		if (freq == clk_get_rate(temp_dev->clk)) {
 			dev_dbg(dev, "%s: Already at the requested"
 				"rate %ld\n", __func__, freq);
-			continue;
+			goto next;
 		}
 
 		r = clk_set_rate(temp_dev->clk, freq);
@@ -852,6 +883,9 @@ static int _dvfs_scale(struct device *req_dev, struct device *target_dev,
 				__func__, freq, r);
 			ret = r;
 		}
+next:
+		dev_list = (volt_scale_dir == DVFS_VOLT_SCALE_DOWN) ?
+				dev_list->prev : dev_list->next;
 	}
 
 	if (ret)
@@ -950,8 +984,15 @@ int omap_device_scale(struct device *req_dev, struct device *target_dev,
 		return -EBUSY;
 	}
 
+#ifdef CONFIG_OMAP4_DPLL_CASCADING
+	if (omap4_is_in_dpll_cascading())
+		return -EBUSY;
+#endif
+
 	/* Lock me to ensure cross domain scaling is secure */
 	mutex_lock(&omap_dvfs_lock);
+	/* I would like CPU to be active always at this point */
+	pm_qos_update_request(&omap_dvfs_pm_qos_handle, 0);
 
 	rcu_read_lock();
 	opp = opp_find_freq_ceil(target_dev, &freq);
@@ -1039,6 +1080,8 @@ int omap_device_scale(struct device *req_dev, struct device *target_dev,
 	}
 	/* Fall through */
 out:
+	/* Remove the latency requirement */
+	pm_qos_update_request(&omap_dvfs_pm_qos_handle, PM_QOS_DEFAULT_VALUE);
 	mutex_unlock(&omap_dvfs_lock);
 	return ret;
 }
@@ -1234,6 +1277,7 @@ int __init omap_dvfs_register_device(struct device *dev, char *voltdm_name,
 	struct clk *clk = NULL;
 	struct voltagedomain *voltdm;
 	int ret = 0;
+	static __initdata bool qos_create;
 
 	if (!voltdm_name) {
 		dev_err(dev, "%s: Bad voltdm name!\n", __func__);
@@ -1307,6 +1351,13 @@ int __init omap_dvfs_register_device(struct device *dev, char *voltdm_name,
 	temp_dev->clk = clk;
 	list_add_tail(&temp_dev->node, &dvfs_info->dev_list);
 
+	/* Simpler to have a single request for all domains */
+	if (!qos_create) {
+		pm_qos_add_request(&omap_dvfs_pm_qos_handle,
+				PM_QOS_CPU_DMA_LATENCY,
+				PM_QOS_DEFAULT_VALUE);
+		qos_create = true;
+	}
 	/* Fall through */
 out:
 	mutex_unlock(&omap_dvfs_lock);
